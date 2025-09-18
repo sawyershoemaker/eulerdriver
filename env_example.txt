@@ -4,6 +4,9 @@
 EULER_USERNAME=your_username_here
 EULER_PASSWORD=your_password_here
 
+# optional: OpenAI API key
+OPENAI_API_KEY=your_openai_api_key_here
+
 # optional: Custom user agent (leave empty for default)
 USER_AGENT=
 

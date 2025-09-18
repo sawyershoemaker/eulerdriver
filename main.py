@@ -82,19 +82,6 @@ class EulerSolver:
             self.logger.error(f"Failed to load answers: {e}")
             return False
     
-    def get_next_problem_to_solve(self) -> Optional[int]:
-        """Get the next unsolved problem number"""
-        if not self.answers:
-            return None
-        
-        # find lowest unsolved problem
-        available_problems = sorted(self.answers.keys())
-        for problem_num in available_problems:
-            if problem_num not in self.solved_problems and problem_num not in self.failed_problems:
-                return problem_num
-        
-        return None
-    
     def solve_problem(self, webdriver: EulerWebdriver, problem_num: int) -> bool:
         """solve a specific problem using the webdriver"""
         try:

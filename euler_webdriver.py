@@ -6,6 +6,8 @@ import os
 import time
 import logging
 import random
+import base64
+import threading
 from typing import Optional, Dict, List, Tuple
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -19,6 +21,7 @@ from selenium.common.exceptions import (
     ElementClickInterceptedException
 )
 from dotenv import load_dotenv
+import openai
 
 # load environment variables
 load_dotenv()
@@ -34,6 +37,11 @@ class EulerWebdriver:
         self.driver = None
         self.wait = None
         self.is_logged_in = False
+        
+        # captcha settings
+        self.captcha_dir = os.path.join(os.getcwd(), "captcha")
+        os.makedirs(self.captcha_dir, exist_ok=True)
+        self.captcha_cleanup_timer = None
         
         # logging setup
         logging.basicConfig(
@@ -231,6 +239,134 @@ class EulerWebdriver:
         except Exception as e:
             self.logger.error(f"Failed to send keys: {e}")
             return False
+    
+    def _screenshot_captcha_element(self, captcha_element) -> Optional[str]:
+        """
+        Take a screenshot of the captcha element to capture the EXACT currently displayed captcha
+        
+        args:
+            captcha_element: The captcha image element
+            
+        returns:
+            Optional[str]: Path to screenshot image or None if failed
+        """
+        try:
+            # verify element is still valid and visible
+            if not captcha_element.is_displayed():
+                self.logger.error("Captcha element is not displayed")
+                return None
+            
+            # ensure the element is visible and in view
+            self.driver.execute_script("arguments[0].scrollIntoView(true);", captcha_element)
+            self._human_delay(0.2, 0.3)  # slightly longer delay to ensure rendering
+            
+            # get element dimensions before screenshot
+            try:
+                size = captcha_element.size
+                location = captcha_element.location
+                self.logger.info(f"Captcha element dimensions: {size}, location: {location}")
+                
+                # check if element has reasonable size
+                if size['width'] < 50 or size['height'] < 20:
+                    self.logger.warning(f"Captcha element seems too small: {size}")
+                    return None
+                    
+            except Exception as e:
+                self.logger.warning(f"Could not get element dimensions: {e}")
+            
+            # take screenshot of the specific element
+            screenshot = captcha_element.screenshot_as_png
+            
+            # verify we got a valid screenshot
+            if len(screenshot) < 1000:  # increased threshold for valid captcha
+                self.logger.warning(f"Screenshot too small ({len(screenshot)} bytes), might be invalid")
+                return None
+            
+            # save the screenshot
+            timestamp = int(time.time())
+            filename = f"captcha_screenshot_{timestamp}.png"
+            filepath = os.path.join(self.captcha_dir, filename)
+            
+            with open(filepath, 'wb') as f:
+                f.write(screenshot)
+            
+            self.logger.info(f"Captured captcha screenshot: {filepath} (size: {len(screenshot)} bytes)")
+            
+            
+            return filepath
+            
+        except Exception as e:
+            self.logger.error(f"Failed to screenshot captcha element: {e}")
+            return None
+    
+    def _delete_captcha_image(self, filepath: str) -> None:
+        """
+        Delete captcha image immediately
+        
+        args:
+            filepath: Path to the captcha image file
+        """
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+                self.logger.info(f"Deleted captcha image: {filepath}")
+        except Exception as e:
+            self.logger.error(f"Failed to delete captcha image {filepath}: {e}")
+    
+    def _solve_captcha_with_openai(self, image_path: str) -> Optional[str]:
+        """
+        Solve captcha using OpenAI API
+        
+        args:
+            image_path: Path to the captcha image
+            
+        returns:
+            Optional[str]: Captcha solution or None if failed
+        """
+        try:
+            # check if OpenAI API key is available
+            api_key = os.getenv('OPENAI_API_KEY')
+            if not api_key:
+                self.logger.warning("OpenAI API key not found in environment variables")
+                return None
+            
+            # initialize OpenAI client
+            client = openai.OpenAI(api_key=api_key)
+            
+            # encode image to base64
+            with open(image_path, 'rb') as image_file:
+                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+            
+            # call OpenAI API
+            response = client.chat.completions.create(
+                model="gpt-5-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "I am having trouble reading this image. Return just the text displayed in this image with no spaces or trailing text. Expect 5-6 numbers."
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{base64_image}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+            )
+            
+            # extract solution
+            solution = response.choices[0].message.content.strip()
+            self.logger.info(f"OpenAI captcha solution: {solution}")
+            return solution
+            
+        except Exception as e:
+            self.logger.error(f"Failed to solve captcha with OpenAI: {e}")
+            return None
     
     def start(self) -> None:
         """Start the webdriver"""
@@ -467,131 +603,6 @@ class EulerWebdriver:
             self.logger.error(f"Failed to navigate to problem {problem_number}: {e}")
             return False
     
-    def get_unsolved_problems(self) -> List[int]:
-        """
-        get list of unsolved problems from the progress page
-        
-        returns:
-            List[int]: List of unsolved problem numbers
-        """
-        try:
-            self.logger.info("Getting list of unsolved problems from progress page...")
-            
-            # navigate to progress page
-            self.driver.get(self.progress_url)
-            self._human_delay(1, 1.5)
-            
-            unsolved_problems = []
-            solved_problems = []
-            
-            try:
-                # look for problem elements on the progress page
-                # solved problems are orange/highlighted
-                # unsolved problems are typically in normal text color
-                
-                # try different selectors for problem links/numbers
-                problem_selectors = [
-                    "//a[contains(@href, 'problem=')]",
-                    "//td[contains(@class, 'id_column')]//a",
-                    "//tr[contains(@class, 'problem_row')]//a",
-                    "//div[contains(@class, 'problem')]//a"
-                ]
-                
-                problem_elements = []
-                for selector in problem_selectors:
-                    try:
-                        elements = self.driver.find_elements(By.XPATH, selector)
-                        if elements:
-                            problem_elements = elements
-                            self.logger.info(f"Found {len(elements)} problem elements using selector: {selector}")
-                            problem_elements = elements
-                            break
-                    except:
-                        continue
-                
-                if not problem_elements:
-                    # fallback: look for any links that might be problems
-                    problem_elements = self.driver.find_elements(By.XPATH, "//a[contains(text(), 'Problem') or contains(@href, 'problem')]")
-                
-                for element in problem_elements:
-                    try:
-                        # extract problem number
-                        href = element.get_attribute('href')
-                        text = element.text
-                        
-                        problem_num = None
-                        
-                        # try to extract from href first
-                        if href and 'problem=' in href:
-                            problem_num = int(href.split('problem=')[1].split('&')[0])
-                        elif text:
-                            # extract from text
-                            import re
-                            match = re.search(r'(\d+)', text)
-                            if match:
-                                problem_num = int(match.group(1))
-                        
-                        if not problem_num:
-                            continue
-                        
-                        # check if this problem is solved by looking at CSS classes
-                        is_solved = False
-                        
-                        # get the parent td element (the actual problem cell)
-                        try:
-                            parent_td = element.find_element(By.XPATH, "./..")
-                            td_class = parent_td.get_attribute('class') or ''
-                            td_style = parent_td.get_attribute('style') or ''
-                            
-                            # debug: log first few elements to see the structure
-                            if problem_num <= 5:
-                                self.logger.info(f"Problem {problem_num} - TD class: '{td_class}', style: '{td_style}'")
-                            
-                            # check for solved indicators
-                            if 'problem_solved' in td_class:
-                                is_solved = True
-                                self.logger.info(f"Problem {problem_num} is SOLVED (has 'problem_solved' class)")
-                            elif 'rgb(255, 186, 0)' in td_style or 'orange' in td_style.lower():
-                                is_solved = True
-                                self.logger.info(f"Problem {problem_num} is SOLVED (has orange background)")
-                            else:
-                                self.logger.debug(f"Problem {problem_num} is unsolved (no solved indicators)")
-                                
-                        except Exception as e:
-                            self.logger.debug(f"Problem {problem_num} - could not check parent TD: {e}")
-                            # fallback: check the element itself
-                            element_class = element.get_attribute('class') or ''
-                            if 'problem_solved' in element_class:
-                                is_solved = True
-                        
-                        # categorize the problem
-                        if is_solved:
-                            solved_problems.append(problem_num)
-                        else:
-                            unsolved_problems.append(problem_num)
-                            
-                    except (ValueError, NoSuchElementException) as e:
-                        self.logger.debug(f"Error processing problem element: {e}")
-                        continue
-                
-                # sort the problems
-                unsolved_problems.sort()
-                solved_problems.sort()
-                
-                self.logger.info(f"Found {len(solved_problems)} solved problems and {len(unsolved_problems)} unsolved problems")
-                self.logger.info(f"Solved problems: {solved_problems[:10]}{'...' if len(solved_problems) > 10 else ''}")
-                self.logger.info(f"Unsolved problems: {unsolved_problems[:10]}{'...' if len(unsolved_problems) > 10 else ''}")
-                
-                return unsolved_problems
-                
-            except Exception as e:
-                self.logger.error(f"Error parsing progress page: {e}")
-                return []
-                
-        except Exception as e:
-            self.logger.error(f"Failed to get unsolved problems from progress page: {e}")
-            return []
-    
     def get_next_unsolved_problem(self) -> Optional[int]:
         """
         get the next unsolved problem from the progress page
@@ -656,133 +667,6 @@ class EulerWebdriver:
             self.logger.error(f"Error getting next unsolved problem: {e}")
             return None
     
-    def get_solved_problems(self) -> List[int]:
-        """
-        get list of solved problems from the progress page
-        
-        returns:
-            List[int]: List of solved problem numbers
-        """
-        try:
-            self.logger.info("Getting list of solved problems from progress page...")
-            
-            # navigate to progress page
-            self.driver.get(self.progress_url)
-            self._human_delay(1, 1.5)
-            
-            solved_problems = []
-            
-            try:
-                # look for problem elements on the progress page
-                # solved problems are orange/highlighted
-                
-                # try different selectors for problem links/numbers
-                problem_selectors = [
-                    "//a[contains(@href, 'problem=')]",
-                    "//td[contains(@class, 'id_column')]//a",
-                    "//tr[contains(@class, 'problem_row')]//a",
-                    "//div[contains(@class, 'problem')]//a"
-                ]
-                
-                problem_elements = []
-                for selector in problem_selectors:
-                    try:
-                        elements = self.driver.find_elements(By.XPATH, selector)
-                        if elements:
-                            problem_elements = elements
-                            break
-                    except:
-                        continue
-                
-                if not problem_elements:
-                    # fallback: look for any links that might be problems
-                    problem_elements = self.driver.find_elements(By.XPATH, "//a[contains(text(), 'Problem') or contains(@href, 'problem')]")
-                
-                for element in problem_elements:
-                    try:
-                        # extract problem number
-                        href = element.get_attribute('href')
-                        text = element.text
-                        
-                        problem_num = None
-                        
-                        # try to extract from href first
-                        if href and 'problem=' in href:
-                            problem_num = int(href.split('problem=')[1].split('&')[0])
-                        elif text:
-                            # extract from text
-                            import re
-                            match = re.search(r'(\d+)', text)
-                            if match:
-                                problem_num = int(match.group(1))
-                        
-                        if not problem_num:
-                            continue
-                        
-                        # check if this problem is solved (orange/highlighted)
-                        is_solved = False
-                        
-                        # check parent row/element for solved indicators
-                        try:
-                            parent = element.find_element(By.XPATH, "./ancestor::tr | ./ancestor::div | ./..")
-                            parent_class = parent.get_attribute('class') or ''
-                            parent_style = parent.get_attribute('style') or ''
-                            
-                            # look for solved indicators
-                            if 'solved' in parent_class.lower() or 'completed' in parent_class.lower():
-                                is_solved = True
-                            elif 'background-color' in parent_style and 'orange' in parent_style.lower():
-                                is_solved = True
-                                
-                        except:
-                            pass
-                        
-                        # check element itself for solved indicators
-                        element_class = element.get_attribute('class') or ''
-                        element_style = element.get_attribute('style') or ''
-                        
-                        if 'solved' in element_class.lower() or 'completed' in element_class.lower():
-                            is_solved = True
-                        elif 'color' in element_style and 'orange' in element_style.lower():
-                            is_solved = True
-                        
-                        # add to solved list if it's solved
-                        if is_solved:
-                            solved_problems.append(problem_num)
-                            
-                    except (ValueError, NoSuchElementException):
-                        continue
-                
-                # sort the problems
-                solved_problems.sort()
-                
-                self.logger.info(f"Found {len(solved_problems)} solved problems")
-                return solved_problems
-                
-            except Exception as e:
-                self.logger.error(f"Error parsing progress page: {e}")
-                return []
-                
-        except Exception as e:
-            self.logger.error(f"Failed to get solved problems from progress page: {e}")
-            return []
-    
-    def find_next_unsolved_problem(self, current_problem: int, unsolved_list: List[int]) -> Optional[int]:
-        """
-        find the next unsolved problem after the current one
-        
-        args:
-            current_problem: Current problem number
-            unsolved_list: List of unsolved problem numbers
-            
-        returns:
-            Optional[int]: Next unsolved problem number, or None if none found
-        """
-        for problem_num in unsolved_list:
-            if problem_num > current_problem:
-                return problem_num
-        return None
-    
     def submit_answer(self, answer: str) -> Tuple[bool, str]:
         """
         submit an answer for the current problem
@@ -795,6 +679,12 @@ class EulerWebdriver:
         """
         try:
             self.logger.info(f"Submitting answer: {answer}")
+            
+            # check for captcha before submitting
+            captcha_handled = self._handle_captcha_if_present(max_retries=3)
+            if not captcha_handled:
+                self.logger.error("Failed to handle captcha before submission")
+                return False, "Captcha handling failed"
             
             # look for answer input field  
             answer_selectors = [
@@ -870,8 +760,12 @@ class EulerWebdriver:
         """
         try:
             # check for rate limiting first
-            if self.is_rate_limited():
-                self.logger.warning("Rate limited after submission, refreshing page...")
+            is_limited, wait_time = self.is_rate_limited()
+            if is_limited:
+                if wait_time:
+                    self.logger.warning(f"Rate limited after submission, need to wait {wait_time} seconds...")
+                else:
+                    self.logger.warning("Rate limited after submission, refreshing page...")
                 if self.wait_for_rate_limit():
                     return "Rate limit cleared, ready for next submission"
                 else:
@@ -893,12 +787,61 @@ class EulerWebdriver:
             self.logger.error(f"Error checking submission result: {e}")
             return f"Error checking result: {e}"
     
-    def is_rate_limited(self) -> bool:
+    def _parse_wait_time_from_message(self, message: str) -> Optional[int]:
         """
-        check if currently rate limited
+        Parse wait time in seconds from rate limit error message
+        
+        args:
+            message: The error message containing wait time information
+            
+        returns:
+            Optional[int]: Wait time in seconds, or None if not found
+        """
+        import re
+        
+        try:
+            # convert to lowercase for case-insensitive matching
+            message_lower = message.lower()
+            
+            # pattern to match "X minute(s), Y second(s)" format
+            minute_second_pattern = r'(\d+)\s+minute(?:s)?,?\s+(\d+)\s+second(?:s)?'
+            match = re.search(minute_second_pattern, message_lower)
+            if match:
+                minutes = int(match.group(1))
+                seconds = int(match.group(2))
+                total_seconds = minutes * 60 + seconds
+                self.logger.info(f"Parsed wait time: {minutes} minutes, {seconds} seconds = {total_seconds} total seconds")
+                return total_seconds
+            
+            # pattern to match just seconds "X second(s)"
+            second_only_pattern = r'(\d+)\s+second(?:s)?'
+            match = re.search(second_only_pattern, message_lower)
+            if match:
+                seconds = int(match.group(1))
+                self.logger.info(f"Parsed wait time: {seconds} seconds")
+                return seconds
+            
+            # pattern to match just minutes "X minute(s)" (convert to seconds)
+            minute_only_pattern = r'(\d+)\s+minute(?:s)?'
+            match = re.search(minute_only_pattern, message_lower)
+            if match:
+                minutes = int(match.group(1))
+                total_seconds = minutes * 60
+                self.logger.info(f"Parsed wait time: {minutes} minutes = {total_seconds} seconds")
+                return total_seconds
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error parsing wait time from message: {e}")
+            return None
+
+    def is_rate_limited(self) -> Tuple[bool, Optional[int]]:
+        """
+        check if currently rate limited and extract wait time if available
         
         returns:
-            bool: True if rate limited, False otherwise
+            Tuple[bool, Optional[int]]: (is_rate_limited, wait_time_seconds)
         """
         try:
             page_text = self.driver.page_source.lower()
@@ -915,167 +858,220 @@ class EulerWebdriver:
             for indicator in rate_limit_indicators:
                 if indicator in page_text:
                     self.logger.warning("Rate limit detected")
-                    return True
+                    
+                    # try to extract wait time from the page content
+                    wait_time = self._parse_wait_time_from_message(page_text)
+                    if wait_time:
+                        self.logger.info(f"Extracted wait time: {wait_time} seconds")
+                        return True, wait_time
+                    else:
+                        self.logger.warning("Rate limit detected but could not parse wait time")
+                        return True, None
             
-            return False
+            return False, None
             
         except Exception as e:
             self.logger.error(f"Error checking rate limit: {e}")
-            return False
+            return False, None
     
     def wait_for_rate_limit(self, max_wait_time: int = 300) -> bool:
         """
-        wait for rate limit to clear by refreshing the page
+        wait for rate limit to clear using precise timing based on extracted wait time
         
         args:
-            max_wait_time: Maximum time to wait in seconds
+            max_wait_time: Maximum time to wait in seconds (fallback if no specific time found)
             
         returns:
             bool: True if rate limit cleared, False if timeout
         """
-        self.logger.info("Rate limit detected, refreshing page to continue...")
-        
         try:
-            # refresh the current page
+            # check current rate limit status and extract wait time
+            is_limited, wait_time = self.is_rate_limited()
+            
+            if not is_limited:
+                self.logger.info("No rate limit detected")
+                return True
+            
+            # determine how long to wait
+            if wait_time is not None:
+                # use the specific wait time from the error message
+                actual_wait_time = min(wait_time, max_wait_time)  # don't exceed max_wait_time
+                self.logger.info(f"Rate limit detected with specific wait time: {wait_time} seconds")
+                self.logger.info(f"Will wait for {actual_wait_time} seconds before refreshing...")
+            else:
+                # fallback to a reasonable default wait time
+                actual_wait_time = min(60, max_wait_time)  # Default to 1 minute or max_wait_time
+                self.logger.warning(f"Rate limit detected but no specific wait time found")
+                self.logger.info(f"Will wait for {actual_wait_time} seconds before refreshing...")
+            
+            # wait for the specified time with progress updates
+            self._wait_with_progress(actual_wait_time)
+            
+            # refresh the page after waiting
+            self.logger.info("Wait time completed, refreshing page...")
             self.driver.refresh()
             self._human_delay(2, 3)
             
             # check if rate limit is cleared
-            if not self.is_rate_limited():
-                self.logger.info("Rate limit cleared after refresh!")
+            is_limited_after, _ = self.is_rate_limited()
+            if not is_limited_after:
+                self.logger.info("Rate limit cleared after timed wait and refresh!")
                 return True
             else:
-                self.logger.warning("Still rate limited after refresh, waiting...")
-                # wait a bit more and try again
+                self.logger.warning("Still rate limited after timed wait, trying one more refresh...")
+                # one more refresh attempt
                 time.sleep(5)
                 self.driver.refresh()
                 self._human_delay(2, 3)
                 
-                if not self.is_rate_limited():
+                is_limited_final, _ = self.is_rate_limited()
+                if not is_limited_final:
                     self.logger.info("Rate limit cleared after second refresh!")
                     return True
                 else:
-                    self.logger.error("Still rate limited after multiple refreshes")
+                    self.logger.error("Still rate limited after multiple refreshes and timed wait")
                     return False
                     
         except Exception as e:
             self.logger.error(f"Error handling rate limit: {e}")
             return False
-    
-    def _solve_captcha(self) -> Optional[str]: ## this function is so dirty from ocr and openai api attempts
+
+    def _wait_with_progress(self, wait_seconds: int) -> None:
         """
-        solve captcha using manual input
+        Wait for specified seconds with progress updates
+        
+        args:
+            wait_seconds: Number of seconds to wait
+        """
+        try:
+            # show progress updates every 10 seconds for waits longer than 30 seconds
+            if wait_seconds > 30:
+                update_interval = 10
+                remaining = wait_seconds
+                
+                while remaining > 0:
+                    if remaining <= update_interval:
+                        # final wait
+                        self.logger.info(f"Final wait: {remaining} seconds remaining...")
+                        time.sleep(remaining)
+                        break
+                    else:
+                        # wait for update interval
+                        self.logger.info(f"Rate limit wait: {remaining} seconds remaining...")
+                        time.sleep(update_interval)
+                        remaining -= update_interval
+            else:
+                # for shorter waits, just wait without progress updates
+                self.logger.info(f"Waiting {wait_seconds} seconds for rate limit to clear...")
+                time.sleep(wait_seconds)
+                
+        except Exception as e:
+            self.logger.error(f"Error during wait: {e}")
+            # fallback to simple sleep
+            time.sleep(wait_seconds)
+    
+    def _solve_captcha(self) -> Optional[str]:
+        """
+        solve captcha using automated OpenAI API with fallback to manual input
         
         returns:
             Optional[str]: Captcha solution or None if failed
         """
         try:
-            # look for captcha image with more specific selectors
-            captcha_selectors = [
-                "//img[@id='captcha_image']",
-                "//img[contains(@id, 'captcha')]",
-                "//img[contains(@src, 'captcha')]",
-                "//img[contains(@alt, 'captcha')]",
-                "//img[contains(@class, 'captcha')]",
-                "//img[contains(@src, 'image')]",
-                "//img[contains(@src, 'data:image')]",
-                "//img[contains(@src, '.png')]",
-                "//img[contains(@src, '.jpg')]",
-                "//img[contains(@src, '.gif')]"
-            ]
-            
             captcha_img = None
-            for selector in captcha_selectors:
+            try:
+                captcha_img = self.driver.find_element(By.ID, "captcha_image")
+                self.logger.info("Found captcha image using id='captcha_image'")
+            except NoSuchElementException:
+                self.logger.info("No captcha image found with id='captcha_image', trying fallback selectors...")
+                # fallback to other selectors
+                captcha_selectors = [
+                    "//img[contains(@id, 'captcha')]",
+                    "//img[contains(@src, 'captcha')]",
+                    "//img[contains(@alt, 'captcha')]",
+                    "//img[contains(@class, 'captcha')]"
+                ]
+                
+                for selector in captcha_selectors:
+                    try:
+                        captcha_img = self.driver.find_element(By.XPATH, selector)
+                        self.logger.info(f"Found captcha image using selector: {selector}")
+                        break
+                    except NoSuchElementException:
+                        continue
+                if not captcha_img:
+                    self.logger.info("No captcha image found with any selector, debugging page images...")
+                    try:
+                        all_images = self.driver.find_elements(By.TAG_NAME, "img")
+                        self.logger.info(f"Found {len(all_images)} total images on page:")
+                        for i, img in enumerate(all_images[:10]):  # show first 10
+                            try:
+                                src = img.get_attribute('src') or 'no src'
+                                img_id = img.get_attribute('id') or 'no id'
+                                img_class = img.get_attribute('class') or 'no class'
+                                img_alt = img.get_attribute('alt') or 'no alt'
+                                self.logger.info(f"  Image {i+1}: id='{img_id}', class='{img_class}', alt='{img_alt}', src='{src[:100]}...'")
+                            except Exception as e:
+                                self.logger.info(f"  Image {i+1}: Error getting attributes: {e}")
+                    except Exception as e:
+                        self.logger.error(f"Error debugging page images: {e}")
+            
+            # verify we found the right element
+            if captcha_img:
                 try:
-                    captcha_img = self.driver.find_element(By.XPATH, selector)
-                    self.logger.info(f"Found captcha image using selector: {selector}")
-                    break
-                except NoSuchElementException:
-                    continue
+                    # get element details for verification
+                    element_id = captcha_img.get_attribute('id') or 'no id'
+                    element_class = captcha_img.get_attribute('class') or 'no class'
+                    element_src = captcha_img.get_attribute('src') or 'no src'
+                    element_size = captcha_img.size
+                    element_location = captcha_img.location
+                    
+                    self.logger.info(f"Captcha element details:")
+                    self.logger.info(f"  ID: {element_id}")
+                    self.logger.info(f"  Class: {element_class}")
+                    self.logger.info(f"  Src: {element_src[:100]}...")
+                    self.logger.info(f"  Size: {element_size}")
+                    self.logger.info(f"  Location: {element_location}")
+                    
+                    # check if element is visible
+                    is_displayed = captcha_img.is_displayed()
+                    self.logger.info(f"  Is displayed: {is_displayed}")
+                    
+                except Exception as e:
+                    self.logger.warning(f"Could not get captcha element details: {e}")
             
             if not captcha_img:
-                self.logger.warning("No captcha image found with any selector")
-                # debug: list all images on the page
-                try:
-                    all_images = self.driver.find_elements(By.TAG_NAME, "img")
-                    self.logger.info(f"Found {len(all_images)} images on page:")
-                    for i, img in enumerate(all_images[:5]):  # show first 5
-                        try:
-                            src = img.get_attribute('src') or 'no src'
-                            img_id = img.get_attribute('id') or 'no id'
-                            img_class = img.get_attribute('class') or 'no class'
-                            self.logger.info(f"  Image {i+1}: id='{img_id}', class='{img_class}', src='{src[:50]}...'")
-                        except:
-                            pass
-                except:
-                    pass
+                self.logger.warning("No captcha image found")
                 return None
             
             self.logger.info("Captcha detected, attempting to solve...")
+            self.logger.info("Capturing currently displayed captcha using screenshot method...")
+            image_path = self._screenshot_captcha_element(captcha_img)
+            if not image_path:
+                self.logger.error("Failed to capture captcha image using screenshot method")
+                return None
             
-            # get manual input for captcha
+            # try to solve with OpenAI API
+            solution = self._solve_captcha_with_openai(image_path)
+            if solution:
+                self.logger.info(f"Successfully solved captcha with OpenAI: {solution}")
+                # delete the captcha image immediately after solving
+                self._delete_captcha_image(image_path)
+                return solution
+            
+            # fallback to manual input
+            self.logger.warning("OpenAI captcha solving failed, falling back to manual input")
+            self.logger.info(f"Captured captcha image saved at: {image_path}")
             captcha_text = input("Enter captcha: ").strip()
+            
+            # delete the captcha image after manual input (regardless of success)
+            self._delete_captcha_image(image_path)
+            
             return captcha_text if captcha_text else None
                 
         except Exception as e:
             self.logger.error(f"Error solving captcha: {e}")
             return None
-    
-    
-    def _check_captcha_failure(self) -> bool:
-        """
-        check if captcha validation failed
-        
-        returns:
-            bool: True if captcha failed, False if successful or no captcha error
-        """
-        try:
-            # wait a moment for any error messages to appear
-            self._human_delay(1, 2)
-            
-            # check page content for captcha failure messages
-            page_text = self.driver.page_source.lower()
-            
-            captcha_failure_indicators = [
-                'confirmation code you entered was not valid',
-                'you did not enter the confirmation code',
-                'captcha is incorrect',
-                'verification code is wrong',
-                'invalid captcha',
-                'wrong captcha',
-                'captcha failed'
-            ]
-            
-            for indicator in captcha_failure_indicators:
-                if indicator in page_text:
-                    self.logger.warning(f"Captcha failure detected: '{indicator}'")
-                    return True
-            
-            # also check for specific error elements
-            error_selectors = [
-                "//div[contains(@class, 'error')]",
-                "//div[contains(@class, 'message')]",
-                "//span[contains(@class, 'error')]",
-                "//p[contains(@class, 'error')]"
-            ]
-            
-            for selector in error_selectors:
-                try:
-                    error_elements = self.driver.find_elements(By.XPATH, selector)
-                    for element in error_elements:
-                        error_text = element.text.lower()
-                        for indicator in captcha_failure_indicators:
-                            if indicator in error_text:
-                                self.logger.warning(f"Captcha failure in error element: '{error_text}'")
-                                return True
-                except:
-                    continue
-            
-            return False
-            
-        except Exception as e:
-            self.logger.error(f"Error checking captcha failure: {e}")
-            return False
     
     def _handle_captcha_if_present(self, max_retries: int = 3) -> bool:
         """
