@@ -1,0 +1,17 @@
+# copy this file to .env and fill in your credentials
+# Format: username=your_username
+# Format: password=your_password
+EULER_USERNAME=your_username_here
+EULER_PASSWORD=your_password_here
+
+# optional: Custom user agent (leave empty for default)
+USER_AGENT=
+
+# optional: Headless mode (true/false, default: false)
+HEADLESS=false
+
+# optional: Delay between actions in seconds (default: 1)
+ACTION_DELAY=1
+
+# optional: Maximum retry attempts for failed operations (default: 3)
+MAX_RETRIES=3
